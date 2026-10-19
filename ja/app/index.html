@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>接続セキュリティ・ステータス</title>
+<style>
+  :root { --ink:#1f2933; --sub:#6b7785; --line:#e3e8ee; --bg:#f4f6f9; --good:#16a34a; --warn:#d97706; --bad:#dc2626; --brand:#2563eb; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:-apple-system,"Hiragino Sans","Noto Sans JP",sans-serif; line-height:1.6; }
+  header { background:#fff; border-bottom:1px solid var(--line); padding:16px 28px; display:flex; align-items:center; gap:14px; }
+  header h1 { margin:0; font-size:19px; } header p { margin:0; color:var(--sub); font-size:12.5px; }
+  header .right { margin-left:auto; text-align:right; font-size:12px; color:var(--sub); }
+  main { max-width:980px; margin:22px auto; padding:0 20px; display:grid; grid-template-columns:1fr 1fr; gap:18px; }
+  @media (max-width:800px){ main { grid-template-columns:1fr; } }
+  .card { background:#fff; border:1px solid var(--line); border-radius:14px; padding:18px 20px; }
+  .wide { grid-column:1 / -1; }
+  .stale .card { opacity:.45; filter:grayscale(.6); }   /* 取得に失敗したときは、古い表示だと分かるようにする */
+  h2 { margin:0 0 10px; font-size:14px; color:var(--sub); font-weight:600; }
+  .big { font-size:22px; font-weight:800; display:flex; align-items:center; gap:10px; }
+  .dot { width:14px; height:14px; border-radius:50%; background:var(--good); flex:0 0 auto; } .dot.bad { background:var(--bad); } .dot.warn { background:var(--warn); }
+  .kv { display:grid; grid-template-columns:120px 1fr; gap:4px 10px; margin-top:12px; font-size:13.5px; } .kv span:nth-child(odd) { color:var(--sub); }
+  .sub { color:var(--sub); font-size:12.5px; margin-top:8px; }
+  svg text { font-family:inherit; }
+  table { width:100%; border-collapse:collapse; font-size:13px; } th, td { text-align:left; padding:7px 8px; border-top:1px solid var(--line); } th { color:var(--sub); font-weight:600; border-top:0; }
+  .tag { font-size:11.5px; padding:2px 8px; border-radius:999px; font-weight:600; } .tag.restart { background:#dbeafe; color:#1e40af; } .tag.unknown { background:#fef3c7; color:#92400e; }
+  details { font-size:13px; } summary { cursor:pointer; font-weight:600; } pre { background:#1f2430; color:#e8e8e8; padding:12px 14px; border-radius:8px; overflow:auto; font-size:12px; line-height:1.55; }
+  #err { display:none; grid-column:1 / -1; background:#fee2e2; border:1px solid #fca5a5; color:#991b1b; padding:10px 14px; border-radius:10px; font-size:13px; }
+  button { font:inherit; border:0; background:#eef2f7; border-radius:8px; padding:6px 12px; cursor:pointer; }
+</style>
+<script src="config.js"></script>
+</head>
+<body>
+<header>
+  <div><h1>接続セキュリティ・ステータス</h1><p>データベースへの接続が暗号化されているか、いつ再起動したか、止まっていた時間はあったか</p></div>
+  <div class="right"><div id="updated">読み込み中…</div><button id="reload">いま更新</button></div>
+</header>
+<main>
+  <div id="err"></div>
+  <section class="card" id="conn"></section>
+  <section class="card" id="uptime"></section>
+  <section class="card wide" id="beat"></section>
+  <section class="card wide" id="gaps"></section>
+  <section class="card wide">
+    <details>
+      <summary>自分でも確かめる（外からの接続のテスト）</summary>
+      <p class="sub">この画面が見ているのは、<b>アプリ（Edge Function）からデータベースへの接続</b>です。外から <code>psql</code> などでつなぐ接続は別なので、次のスクリプトで、わざと間違ったパスワードを使って確かめます。</p>
+<pre>export PGHOST="aws-0-&lt;リージョン&gt;.pooler.supabase.com"
+export PGUSER="postgres.&lt;PROJECT_REF&gt;"
+./scripts/check-ssl.sh
+# SSLを強制していれば: sslmode=disable が (ESSLREQUIRED) で断られる</pre>
+    </details>
+  </section>
+</main>
+<script>
+const cfg = window.APP_CONFIG
+const $ = (id) => document.getElementById(id)
+const showErr = (m) => { $('err').style.display = m ? 'block' : 'none'; $('err').textContent = m || '' }
+if (!cfg || !cfg.SUPABASE_URL || !cfg.SUPABASE_PUBLISHABLE_KEY) {
+  showErr('config.js がありません。config.example.js をコピーして、値を入れてください。'); throw new Error('config.js is missing')
+}
+const jst = (iso) => new Date(iso).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', hour12: false })
+const hhmm = (iso) => new Date(iso).toLocaleTimeString('ja-JP', { timeZone: 'Asia/Tokyo', hour12: false, hour: '2-digit', minute: '2-digit' })
+const dur = (sec) => sec >= 86400 ? `${Math.floor(sec / 86400)}日${Math.floor(sec % 86400 / 3600)}時間` : sec >= 3600 ? `${Math.floor(sec / 3600)}時間${Math.floor(sec % 3600 / 60)}分` : sec >= 60 ? `${Math.floor(sec / 60)}分${Math.floor(sec % 60)}秒` : `${Math.floor(sec)}秒`
+
+let lastOk = null
+async function load() {
+  showErr(''); document.querySelector('main').classList.remove('stale')
+  try {
+    const res = await fetch(`${cfg.SUPABASE_URL}/functions/v1/security-status`, { method: 'POST', headers: { 'Content-Type': 'application/json', apikey: cfg.SUPABASE_PUBLISHABLE_KEY }, body: '{}' })
+    const d = await res.json(); if (!res.ok) throw new Error(d.error || `HTTP ${res.status}`)
+    render(d); lastOk = new Date(); $('updated').textContent = '更新：' + lastOk.toLocaleTimeString('ja-JP', { hour12: false })
+  } catch (e) {
+    showErr('状態を読めませんでした：' + e.message + (lastOk ? `。下の表示は ${lastOk.toLocaleTimeString('ja-JP', { hour12: false })} 時点の古い情報です。` : ''))
+    if (lastOk) document.querySelector('main').classList.add('stale')
+  }
+}
+
+function render(d) {
+  const c = d.connection
+  $('conn').innerHTML = c && c.ssl
+    ? `<h2>アプリ → データベースの接続</h2><div class="big"><span class="dot"></span>暗号化されています</div>
+       <div class="kv"><span>TLSのバージョン</span><span>${c.tls_version}</span><span>暗号方式</span><span>${c.cipher}</span><span>鍵の長さ</span><span>${c.bits} bit</span></div>
+       <div class="sub">この関数が使っている接続を、データベース自身（pg_stat_ssl）に聞いた結果です。</div>`
+    : `<h2>アプリ → データベースの接続</h2><div class="big"><span class="dot bad"></span>暗号化されていません</div><div class="sub">SSLの設定を確認してください。</div>`
+
+  const start = new Date(d.database.started_at), now = new Date(d.database.now)
+  const up = (now - start) / 1000
+  $('uptime').innerHTML = `<h2>データベースの稼働</h2><div class="big"><span class="dot ${up < 300 ? 'warn' : ''}"></span>稼働 ${dur(up)}</div>
+    <div class="kv"><span>最後の再起動</span><span>${jst(d.database.started_at)}（日本時間）</span><span>Postgres</span><span>${d.database.server_version}</span></div>
+    <div class="sub">${up < 300 ? '再起動して間もありません。' : '設定の変更などで再起動すると、ここの時刻が新しくなります。'}</div>`
+
+  // 直近60分を1分ごとの棒に（10秒ごとのジョブなら、1分に6回が目安）
+  const byMin = new Map(d.perMinute.map((r) => [new Date(r.minute).getTime(), r.runs]))
+  const endMin = Math.floor(now.getTime() / 60000) * 60000
+  const bars = []; for (let i = 59; i >= 0; i--) { const t = endMin - i * 60000; bars.push({ t, runs: byMin.get(t) ?? 0 }) }
+  const incomplete = bars.slice(0, 59).filter((b) => b.runs < 6).length   // いまの分（途中）は数えない
+  const W = 880, H = 120, bw = W / 60
+  const color = (r, last) => last ? '#93c5fd' : r >= 6 ? '#16a34a' : r > 0 ? '#d97706' : '#dc2626'
+  $('beat').innerHTML = `<h2>定期ジョブ（cron）の実行：直近60分</h2>
+    <svg viewBox="0 0 ${W} ${H + 24}" width="100%" role="img" aria-label="1分ごとのcron実行回数">
+      ${bars.map((b, i) => `<rect x="${i * bw + 1}" y="${H - Math.min(b.runs, 6) / 6 * H}" width="${bw - 2}" height="${Math.max(Math.min(b.runs, 6) / 6 * H, 3)}" rx="2" fill="${color(b.runs, i === 59)}"><title>${hhmm(new Date(b.t).toISOString())}：${b.runs}回</title></rect>`).join('')}
+      <text x="0" y="${H + 18}" font-size="11" fill="#6b7785">${hhmm(new Date(bars[0].t).toISOString())}</text>
+      <text x="${W}" y="${H + 18}" font-size="11" fill="#6b7785" text-anchor="end">いま</text>
+    </svg>
+    <div class="sub">棒の高さ＝1分間の実行回数（10秒ごとのジョブなら6回が目安）。緑＝6回、橙＝一部だけ、赤＝0回、水色＝いまの分（途中）。${incomplete === 0 ? '直近60分は、すべての分で6回そろっています。' : `${incomplete}分は6回に届きませんでした（少しのずれのこともあります。0回の分があれば、止まっていた可能性が高いです）。`}</div>`
+
+  const rows = d.gaps.map((g) => {
+    const restarted = start >= new Date(g.from_ts) && start <= new Date(g.to_ts)
+    return `<tr><td>${jst(g.from_ts)}</td><td>${jst(g.to_ts)}</td><td>${dur(g.seconds)}</td><td><span class="tag ${restarted ? 'restart' : 'unknown'}">${restarted ? 'データベースの再起動' : '原因は不明（ジョブの停止・作り直しなど）'}</span></td></tr>`
+  }).join('')
+  $('gaps').innerHTML = `<h2>止まっていた時間帯（直近72時間・25秒より長い空白）</h2>` +
+    (d.gaps.length ? `<table><thead><tr><th>から</th><th>まで</th><th>長さ</th><th>推定</th></tr></thead><tbody>${rows}</tbody></table>
+      <div class="sub">「再起動」と判定しているのは、最後の起動時刻がその空白の中に入っているものだけです。それ以前の再起動は、起動時刻の記録が残っていないため「不明」になります。</div>` : `<div class="sub">空白はありませんでした。</div>`)
+}
+$('reload').onclick = load; load(); setInterval(load, 30000)
+</script>
+</body>
+</html>
